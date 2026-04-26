@@ -38,9 +38,9 @@ PromptOrchestrator.cs resolves the correct IAiProvider from the model string
         ↓
 IAiProvider (Claude/GPT/Gemini) calls the selected AI vendor API using the user's key
         ↓
-AI responds with hybrid format (JSON block + csharp code blocks)
+AI responds with tool_use content blocks (typed, structured — no text parsing)
         ↓
-ActionParser.cs splits them — JSON for instructions, code blocks for scripts
+ToolUseParser.cs extracts text blocks → Reply, tool_use blocks → Actions + Scripts
         ↓
 Validated response returned to Unity plugin
         ↓
@@ -51,56 +51,58 @@ Scene changes execute, .cs files are written, chat window updates
 
 ---
 
-## Hybrid Response Format (Critical Design Decision)
+## Tool Use Format (Critical Design Decision)
 
-Claude must never put code inside JSON — special characters break JSON parsing. Instead, Claude returns two separate block types in one response:
+Instead of asking the AI to format responses as a custom text structure, the backend uses the Anthropic API's native **tool_use** feature. Tools are defined once in `UnityToolDefinitions` as typed JSON schemas and passed on every request. Claude responds with structured `tool_use` content blocks — no regex, no parsing contracts.
 
-```
+### Request shape (tools array sent to Claude)
+
 ```json
 {
-  "reply": "Here's a complete health system attached to your Player.",
-  "actions": [
+  "model": "claude-sonnet-4-6",
+  "system": "...",
+  "tools": [
     {
-      "action": "generate_script",
-      "filename": "HealthSystem",
-      "attach_to": "Player",
-      "script_key": "HealthSystem"
+      "name": "generate_script",
+      "description": "Writes a complete, compilable C# Unity script to disk and optionally attaches it to a scene object after recompile.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "filename":  { "type": "string", "description": "Script filename without .cs extension" },
+          "attach_to": { "type": "string", "description": "GameObject name to attach after recompile (optional)" },
+          "code":      { "type": "string", "description": "Full compilable C# Unity script source code" }
+        },
+        "required": ["filename", "code"]
+      }
+    }
+  ],
+  "messages": [...]
+}
+```
+
+### Response shape (what Claude returns)
+
+```json
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Here's a complete health system attached to your Player."
+    },
+    {
+      "type": "tool_use",
+      "name": "generate_script",
+      "input": {
+        "filename": "HealthSystem",
+        "attach_to": "Player",
+        "code": "using UnityEngine;\nusing System;\n\npublic class HealthSystem : MonoBehaviour\n{\n    public float maxHealth = 100f;\n    private float _currentHealth;\n    public event Action OnDeath;\n\n    void Start() { _currentHealth = maxHealth; }\n\n    public void TakeDamage(float amount)\n    {\n        _currentHealth -= amount;\n        if (_currentHealth <= 0) { _currentHealth = 0; OnDeath?.Invoke(); }\n    }\n\n    public float GetHealth() => _currentHealth;\n}"
+      }
     }
   ]
 }
 ```
 
-```csharp:HealthSystem
-using UnityEngine;
-using System;
-
-public class HealthSystem : MonoBehaviour
-{
-    public float maxHealth = 100f;
-    private float _currentHealth;
-    public event Action OnDeath;
-
-    void Start()
-    {
-        _currentHealth = maxHealth;
-    }
-
-    public void TakeDamage(float amount)
-    {
-        _currentHealth -= amount;
-        if (_currentHealth <= 0)
-        {
-            _currentHealth = 0;
-            OnDeath?.Invoke();
-        }
-    }
-
-    public float GetHealth() => _currentHealth;
-}
-```
-```
-
-The `script_key` in the JSON action must exactly match the label after the colon in the csharp block. Multiple scripts in one response are supported — each gets its own labeled block.
+`ToolUseParser` walks the `content` array: `type: "text"` blocks become `Reply`, `type: "tool_use"` blocks become `Actions`. For `generate_script`, the `code` parameter is extracted into `Scripts` — the Unity plugin's `GenerateScriptAction` sees no difference. Multiple tool calls in one response are fully supported.
 
 ---
 
@@ -113,8 +115,8 @@ External vendors (Anthropic, OpenAI, Google) are isolated entirely inside Infras
 ```
 Backend/
   Api/             HTTP surface — Program.cs, endpoint mapping, request/response wiring
-  Application/     Use cases and orchestration — PromptOrchestrator, PromptBuilder, ActionParser
-                   Provider-agnostic: any model follows the hybrid format via the system prompt
+  Application/     Use cases and orchestration — PromptOrchestrator, PromptBuilder, UnityToolDefinitions, ToolUseParser
+                   Provider-agnostic: typed tool schemas enforce action structure on any model
   Domain/          Core contracts and pure data — no external dependencies
     Interfaces/    IAiProvider — the only abstraction the rest of the app needs
     Models/        PromptRequest, ClaudeResponse, UnityAction — shared data shapes
@@ -129,7 +131,7 @@ Backend/
 public interface IAiProvider
 {
     string ProviderId { get; }   // "claude", "openai", "gemini"
-    Task<string> SendAsync(PromptRequest request, string systemPrompt);
+    Task<AiProviderResponse> SendAsync(PromptRequest request, string systemPrompt, IEnumerable<ToolDefinition> tools);
 }
 ```
 
@@ -143,12 +145,12 @@ Unity sends: { userMessage, sceneContext, history, model: "gpt-4o" }
                           ↓
 PromptOrchestrator resolves IAiProvider by model string
                           ↓
-IAiProvider.SendAsync() → raw text back (vendor handles HTTP + auth)
+IAiProvider.SendAsync() → AiProviderResponse (vendor handles HTTP + auth, normalizes tool_use blocks)
                           ↓
-ActionParser.Parse(rawText) → ClaudeResponse (same for all providers)
+ToolUseParser.Parse(response) → ClaudeResponse (same for all providers)
 ```
 
-The system prompt enforces the hybrid format on any model. Parsing is always the same.
+The typed tool schemas in `UnityToolDefinitions` enforce action structure on any model. `ToolUseParser` maps the result the same way regardless of which provider was called.
 
 ### Model field in PromptRequest
 
@@ -180,15 +182,18 @@ ClaudeForUnity/
 │   │   │   └── IAiProvider.cs                 # Provider contract
 │   │   └── Models/
 │   │       ├── PromptRequest.cs               # Includes Model field
-│   │       ├── ClaudeResponse.cs
+│   │       ├── ToolDefinition.cs              # Provider-agnostic tool schema (ToolDefinition + ToolParameter)
+│   │       ├── AiProviderResponse.cs          # Normalized response + ToolInvocation list
+│   │       ├── ClaudeResponse.cs              # Outbound shape to Unity plugin
 │   │       └── UnityAction.cs
 │   ├── Application/
-│   │   ├── PromptOrchestrator.cs              # Resolves provider, calls it, parses result
-│   │   ├── PromptBuilder.cs                   # System prompt (provider-agnostic)
-│   │   └── ActionParser.cs                    # Parses hybrid response (same for all)
+│   │   ├── PromptOrchestrator.cs              # Resolves provider, passes tools, maps response
+│   │   ├── PromptBuilder.cs                   # System prompt — role + rules only
+│   │   ├── UnityToolDefinitions.cs            # Typed JSON schemas for all 5 actions
+│   │   └── ToolUseParser.cs                   # Maps AiProviderResponse → ClaudeResponse
 │   └── Infrastructure/
 │       └── Providers/
-│           ├── ClaudeProvider.cs              # Anthropic API implementation
+│           ├── ClaudeProvider.cs              # Anthropic API: tool_use request + response parsing
 │           ├── OpenAiProvider.cs              # OpenAI API implementation
 │           └── GeminiProvider.cs             # Google Gemini implementation
 │
@@ -257,10 +262,75 @@ public class ConversationMessage
 > gets used for that one call, and is discarded. The backend is a stateless proxy — it never
 > logs or persists keys.
 
+### `Domain/Models/ToolDefinition.cs`
+```csharp
+namespace ClaudeForUnity.Backend.Domain.Models;
+
+/// <summary>
+/// Provider-agnostic description of a tool the AI can call.
+/// Each IAiProvider translates this into its own vendor format internally —
+/// Anthropic uses input_schema, Gemini uses parameters with uppercase types,
+/// OpenAI wraps in { type: "function", function: { ... } }.
+/// </summary>
+public class ToolDefinition
+{
+    public string Name { get; set; } = "";
+    public string Description { get; set; } = "";
+    public List<ToolParameter> Parameters { get; set; } = new();
+}
+
+public class ToolParameter
+{
+    public string Name { get; set; } = "";
+    public string Description { get; set; } = "";
+
+    /// <summary>JSON Schema type: "string", "number", "boolean", "array"</summary>
+    public string Type { get; set; } = "string";
+
+    public bool Required { get; set; }
+
+    /// <summary>For string parameters — restricts to an allowed set of values.</summary>
+    public string[]? EnumValues { get; set; }
+
+    /// <summary>For array parameters — the type of each item ("string" or "number").</summary>
+    public string? ArrayItemType { get; set; }
+}
+```
+
+### `Domain/Models/AiProviderResponse.cs`
+```csharp
+using System.Text.Json.Nodes;
+
+namespace ClaudeForUnity.Backend.Domain.Models;
+
+/// <summary>
+/// Normalized response returned by every IAiProvider implementation.
+/// Provider-specific shapes (Anthropic content blocks, OpenAI tool_calls, etc.)
+/// are mapped into this common structure inside the provider — nothing above
+/// Infrastructure ever sees vendor-specific formats.
+/// </summary>
+public class AiProviderResponse
+{
+    public string Reply { get; set; } = "";
+    public List<ToolInvocation> ToolCalls { get; set; } = new();
+}
+
+public class ToolInvocation
+{
+    public string ToolName { get; set; } = "";
+    public JsonObject Input { get; set; } = new();
+}
+```
+
 ### `Domain/Models/ClaudeResponse.cs`
 ```csharp
 namespace ClaudeForUnity.Backend.Domain.Models;
 
+/// <summary>
+/// The outbound response shape returned to the Unity plugin.
+/// Shape is stable — the plugin never needs to change when backend internals evolve.
+/// ToolUseParser maps AiProviderResponse → ClaudeResponse.
+/// </summary>
 public class ClaudeResponse
 {
     public string Reply { get; set; } = "";
@@ -286,36 +356,16 @@ public class UnityAction
 ```csharp
 namespace ClaudeForUnity.Backend.Application;
 
+/// <summary>
+/// Builds the system prompt. With tool_use, there is no need to engineer a custom
+/// response format — available actions are defined as typed tool schemas in
+/// UnityToolDefinitions and enforced by the API. The system prompt covers only
+/// role identity, script quality rules, and general behavior guidelines.
+/// </summary>
 public static class PromptBuilder
 {
     public static string BuildSystemPrompt() => """
         You are an expert Unity game developer AI assistant embedded inside the Unity Editor.
-
-        ## RESPONSE FORMAT
-        Always respond with a JSON block first, then any code blocks after.
-
-        ### JSON block (always required):
-        ```json
-        {
-          "reply": "Your explanation to the developer",
-          "actions": [ ... ]
-        }
-        ```
-
-        ### Code blocks (only when generate_script is in actions):
-        ```csharp:ScriptName
-        // full script here
-        ```
-
-        The "script_key" in the action must exactly match the label after the colon in the code block.
-        You can return multiple code blocks if multiple scripts are requested.
-
-        ## AVAILABLE ACTIONS
-        - create_object: { name, position[x,y,z], scale[x,y,z], primitive(Cube/Sphere/Capsule/Plane/Cylinder), components[] }
-        - modify_object: { target_name, position, scale, rotation }
-        - generate_script: { filename, attach_to, script_key }
-        - set_material: { target_name, color[r,g,b], shader }
-        - suggest_design: { title, description, steps[] }
 
         ## SCRIPT WRITING RULES
         - Always write complete, compilable, immediately testable C# Unity scripts
@@ -325,80 +375,164 @@ public static class PromptBuilder
         - Never leave placeholder comments like "// implement this" — write the actual implementation
 
         ## RULES
-        - Always include a helpful "reply" even if no actions are needed
+        - Always include a helpful reply text even if no tool calls are needed
         - Only use components that exist in UnityEngine (Rigidbody, BoxCollider, AudioSource, etc.)
-        - If the user asks a question with no scene changes needed, return an empty actions array
+        - If the user asks a question with no scene changes needed, respond with text only — no tool calls
         - Be concise, practical, and think like a senior Unity developer
         """;
 }
 ```
 
-### `Application/ActionParser.cs`
+### `Application/ToolUseParser.cs`
 ```csharp
-using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 using ClaudeForUnity.Backend.Domain.Models;
 
 namespace ClaudeForUnity.Backend.Application;
 
-public static class ActionParser
+/// <summary>
+/// Maps the normalized AiProviderResponse (from any IAiProvider) into the
+/// ClaudeResponse shape that the Unity plugin consumes. No regex — the input
+/// is already structured from the tool_use API response.
+/// </summary>
+public static class ToolUseParser
 {
-    public static ClaudeResponse Parse(string rawText)
+    public static ClaudeResponse Parse(AiProviderResponse response)
     {
-        var result = new ClaudeResponse();
-
-        // Extract JSON block
-        var jsonMatch = Regex.Match(rawText, @"```json\n([\s\S]*?)\n```");
-        if (!jsonMatch.Success)
+        var result = new ClaudeResponse
         {
-            result.Reply = rawText;
-            return result;
-        }
+            Reply = response.Reply
+        };
 
-        var jsonDoc = JsonNode.Parse(jsonMatch.Groups[1].Value)!;
-        result.Reply = jsonDoc["reply"]?.GetValue<string>() ?? "";
-
-        var actions = jsonDoc["actions"]?.AsArray();
-        if (actions != null)
+        foreach (var toolCall in response.ToolCalls)
         {
-            foreach (var action in actions)
+            result.Actions.Add(new UnityAction
             {
-                var actionObj = action?.AsObject();
-                if (actionObj == null) continue;
+                Action = toolCall.ToolName,
+                Data   = toolCall.Input
+            });
 
-                result.Actions.Add(new UnityAction
-                {
-                    Action = actionObj["action"]?.GetValue<string>() ?? "",
-                    Data = actionObj
-                });
+            // generate_script carries code as a typed parameter — pull it into Scripts
+            if (toolCall.ToolName == "generate_script")
+            {
+                var filename = toolCall.Input["filename"]?.GetValue<string>();
+                var code     = toolCall.Input["code"]?.GetValue<string>();
+
+                if (!string.IsNullOrEmpty(filename) && !string.IsNullOrEmpty(code))
+                    result.Scripts[filename] = code;
             }
         }
 
-        // Extract all csharp:Key blocks
-        var csharpMatches = Regex.Matches(rawText, @"```csharp:(\w+)\n([\s\S]*?)\n```");
-        foreach (Match match in csharpMatches)
-        {
-            result.Scripts[match.Groups[1].Value] = match.Groups[2].Value;
-        }
-
-        Validate(result);
         return result;
     }
+}
+```
 
-    private static void Validate(ClaudeResponse response)
+### `Application/UnityToolDefinitions.cs`
+```csharp
+using ClaudeForUnity.Backend.Domain.Models;
+
+namespace ClaudeForUnity.Backend.Application;
+
+/// <summary>
+/// The single source of truth for every action the AI can perform in Unity.
+/// Returns provider-agnostic ToolDefinition objects — each IAiProvider translates
+/// these into its own vendor format (Anthropic, Gemini, OpenAI) internally.
+/// Adding a new action: add one entry here — no changes needed anywhere else.
+/// </summary>
+public static class UnityToolDefinitions
+{
+    public static IEnumerable<ToolDefinition> GetAll() => new[]
     {
-        foreach (var action in response.Actions)
+        new ToolDefinition
         {
-            if (action.Action != "generate_script") continue;
-
-            var scriptKey = action.Data?["script_key"]?.GetValue<string>();
-            if (string.IsNullOrEmpty(scriptKey))
-                throw new InvalidOperationException("generate_script action is missing script_key");
-
-            if (!response.Scripts.ContainsKey(scriptKey))
-                throw new InvalidOperationException($"No code block found for script_key: {scriptKey}");
+            Name        = "create_object",
+            Description = "Creates a new GameObject in the Unity scene with optional mesh, transform, and components.",
+            Parameters  = new List<ToolParameter>
+            {
+                new() { Name = "name",       Type = "string", Description = "The name for the new GameObject",                                              Required = true  },
+                new() { Name = "position",   Type = "array",  Description = "World position [x, y, z]",                     ArrayItemType = "number"                       },
+                new() { Name = "scale",      Type = "array",  Description = "Local scale [x, y, z]",                        ArrayItemType = "number"                       },
+                new() { Name = "primitive",  Type = "string", Description = "Primitive mesh to attach",                     EnumValues = new[] { "Cube", "Sphere", "Capsule", "Plane", "Cylinder" } },
+                new() { Name = "components", Type = "array",  Description = "UnityEngine component names (e.g. Rigidbody)", ArrayItemType = "string"                       }
+            }
+        },
+        new ToolDefinition
+        {
+            Name        = "modify_object",
+            Description = "Modifies the transform (position, scale, rotation) of an existing scene object by name.",
+            Parameters  = new List<ToolParameter>
+            {
+                new() { Name = "target_name", Type = "string", Description = "Exact name of the GameObject to modify",  Required = true  },
+                new() { Name = "position",    Type = "array",  Description = "New world position [x, y, z]",            ArrayItemType = "number" },
+                new() { Name = "scale",       Type = "array",  Description = "New local scale [x, y, z]",               ArrayItemType = "number" },
+                new() { Name = "rotation",    Type = "array",  Description = "New euler angles [x, y, z]",              ArrayItemType = "number" }
+            }
+        },
+        new ToolDefinition
+        {
+            Name        = "generate_script",
+            Description = "Writes a complete, compilable C# Unity script to disk and optionally attaches it to a scene object after recompile.",
+            Parameters  = new List<ToolParameter>
+            {
+                new() { Name = "filename",  Type = "string", Description = "Script filename without .cs extension",                        Required = true  },
+                new() { Name = "attach_to", Type = "string", Description = "GameObject name to attach after recompile (optional)"                          },
+                new() { Name = "code",      Type = "string", Description = "Full compilable C# Unity script source code",                  Required = true  }
+            }
+        },
+        new ToolDefinition
+        {
+            Name        = "set_material",
+            Description = "Applies a material with a specified color and shader to a scene object.",
+            Parameters  = new List<ToolParameter>
+            {
+                new() { Name = "target_name", Type = "string", Description = "Exact name of the GameObject",                   Required = true  },
+                new() { Name = "color",       Type = "array",  Description = "RGB color values [r, g, b] in range 0–1",        ArrayItemType = "number" },
+                new() { Name = "shader",      Type = "string", Description = "Shader name (e.g. Standard, Unlit/Color)"                         }
+            }
+        },
+        new ToolDefinition
+        {
+            Name        = "suggest_design",
+            Description = "Returns a structured design suggestion. No scene changes are made.",
+            Parameters  = new List<ToolParameter>
+            {
+                new() { Name = "title",       Type = "string", Description = "Short title for the suggestion",  Required = true  },
+                new() { Name = "description", Type = "string", Description = "One or two sentence overview",    Required = true  },
+                new() { Name = "steps",       Type = "array",  Description = "Ordered list of actionable steps", ArrayItemType = "string" }
+            }
         }
+    };
+}
+```
+
+### `Application/PromptOrchestrator.cs`
+```csharp
+using ClaudeForUnity.Backend.Domain.Interfaces;
+using ClaudeForUnity.Backend.Domain.Models;
+
+namespace ClaudeForUnity.Backend.Application;
+
+public class PromptOrchestrator
+{
+    private readonly IEnumerable<IAiProvider> _providers;
+
+    public PromptOrchestrator(IEnumerable<IAiProvider> providers)
+    {
+        _providers = providers;
+    }
+
+    public async Task<ClaudeResponse> HandleAsync(PromptRequest request)
+    {
+        // Match provider by model string prefix: "claude-*" → ClaudeProvider, etc.
+        var provider = _providers.FirstOrDefault(p =>
+            request.Model.StartsWith(p.ProviderId, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"No provider registered for model: {request.Model}");
+
+        var systemPrompt                       = PromptBuilder.BuildSystemPrompt();
+        IEnumerable<ToolDefinition> tools      = UnityToolDefinitions.GetAll();
+
+        var providerResponse = await provider.SendAsync(request, systemPrompt, tools);
+        return ToolUseParser.Parse(providerResponse);
     }
 }
 ```
@@ -407,6 +541,7 @@ public static class ActionParser
 ```csharp
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using ClaudeForUnity.Backend.Domain.Interfaces;
 using ClaudeForUnity.Backend.Domain.Models;
 
@@ -422,7 +557,10 @@ public class ClaudeProvider : IAiProvider
         _httpClient = httpClient;
     }
 
-    public async Task<string> SendAsync(PromptRequest request, string systemPrompt)
+    public async Task<AiProviderResponse> SendAsync(
+        PromptRequest request,
+        string systemPrompt,
+        IEnumerable<ToolDefinition> tools)
     {
         var messages = new List<object>();
 
@@ -431,15 +569,16 @@ public class ClaudeProvider : IAiProvider
 
         messages.Add(new
         {
-            role = "user",
+            role    = "user",
             content = $"{request.UserMessage}\n\n---\n{request.SceneContext}"
         });
 
         var body = new
         {
-            model = request.Model,
+            model      = request.Model,
             max_tokens = 4096,
-            system = systemPrompt,
+            system     = systemPrompt,
+            tools      = ToAnthropicTools(tools),   // translate to Anthropic format
             messages
         };
 
@@ -455,12 +594,156 @@ public class ClaudeProvider : IAiProvider
         var response = await _httpClient.SendAsync(httpRequest);
         response.EnsureSuccessStatusCode();
 
-        var responseBody = await response.Content.ReadAsStringAsync();
-        var doc = JsonDocument.Parse(responseBody);
-        return doc.RootElement
-            .GetProperty("content")[0]
-            .GetProperty("text")
-            .GetString() ?? "";
+        return ParseResponse(await response.Content.ReadAsStringAsync());
+    }
+
+    // ── Anthropic translation ──────────────────────────────────────────────────
+
+    private static IEnumerable<object> ToAnthropicTools(IEnumerable<ToolDefinition> tools) =>
+        tools.Select(t => new
+        {
+            name         = t.Name,
+            description  = t.Description,
+            input_schema = new
+            {
+                type       = "object",
+                properties = t.Parameters.ToDictionary(p => p.Name, BuildAnthropicProperty),
+                required   = t.Parameters.Where(p => p.Required).Select(p => p.Name).ToArray()
+            }
+        });
+
+    private static JsonObject BuildAnthropicProperty(ToolParameter p)
+    {
+        var prop = new JsonObject
+        {
+            ["type"]        = p.Type,
+            ["description"] = p.Description
+        };
+
+        if (p.Type == "array" && p.ArrayItemType != null)
+            prop["items"] = new JsonObject { ["type"] = p.ArrayItemType };
+
+        if (p.EnumValues != null)
+            prop["enum"] = new JsonArray(p.EnumValues.Select(v => JsonValue.Create(v)).ToArray<JsonNode?>());
+
+        return prop;
+    }
+
+    // ── Response parsing ───────────────────────────────────────────────────────
+
+    private static AiProviderResponse ParseResponse(string responseBody)
+    {
+        var result = new AiProviderResponse();
+        var doc    = JsonDocument.Parse(responseBody);
+
+        foreach (var block in doc.RootElement.GetProperty("content").EnumerateArray())
+        {
+            var type = block.GetProperty("type").GetString();
+
+            if (type == "text")
+            {
+                result.Reply = block.GetProperty("text").GetString() ?? "";
+            }
+            else if (type == "tool_use")
+            {
+                var toolName  = block.GetProperty("name").GetString() ?? "";
+                var inputJson = block.GetProperty("input").GetRawText();
+
+                result.ToolCalls.Add(new ToolInvocation
+                {
+                    ToolName = toolName,
+                    Input    = JsonNode.Parse(inputJson)?.AsObject() ?? new JsonObject()
+                });
+            }
+        }
+
+        return result;
+    }
+}
+```
+
+### `Infrastructure/Providers/GeminiProvider.cs`
+```csharp
+using ClaudeForUnity.Backend.Domain.Interfaces;
+using ClaudeForUnity.Backend.Domain.Models;
+
+namespace ClaudeForUnity.Backend.Infrastructure.Providers;
+
+/// <summary>
+/// Google Gemini implementation of IAiProvider.
+///
+/// Key translation differences vs. Anthropic:
+///   - Tools are wrapped in { "tools": [{ "functionDeclarations": [...] }] }
+///   - Type names are uppercase: STRING, NUMBER, ARRAY, OBJECT
+///   - Response uses "functionCall" content parts instead of "tool_use" blocks
+///   - Auth uses a query param (?key=) or Bearer token, not x-api-key header
+///
+/// TODO (Phase 5 — multi-provider):
+///   - Implement ToGeminiTools() translation (mirrors ToAnthropicTools pattern)
+///   - Implement ParseResponse() for Gemini's functionCall response format
+///   - Wire up API endpoint and auth
+/// </summary>
+public class GeminiProvider : IAiProvider
+{
+    private readonly HttpClient _httpClient;
+    public string ProviderId => "gemini";
+
+    public GeminiProvider(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+    }
+
+    public Task<AiProviderResponse> SendAsync(
+        PromptRequest request,
+        string systemPrompt,
+        IEnumerable<ToolDefinition> tools)
+    {
+        throw new NotImplementedException(
+            "GeminiProvider is not yet implemented. " +
+            "Implement ToGeminiTools() and ParseResponse() following the ClaudeProvider pattern.");
+    }
+}
+```
+
+### `Infrastructure/Providers/OpenAiProvider.cs`
+```csharp
+using ClaudeForUnity.Backend.Domain.Interfaces;
+using ClaudeForUnity.Backend.Domain.Models;
+
+namespace ClaudeForUnity.Backend.Infrastructure.Providers;
+
+/// <summary>
+/// OpenAI (GPT) implementation of IAiProvider.
+///
+/// Key translation differences vs. Anthropic:
+///   - Each tool is wrapped in { "type": "function", "function": { ... } }
+///   - Property schema uses "parameters" (same JSON Schema shape as Anthropic's input_schema)
+///   - Response uses "tool_calls" array on the message, with "arguments" as a JSON string
+///   - Auth uses Authorization: Bearer header
+///
+/// TODO (Phase 5 — multi-provider):
+///   - Implement ToOpenAiTools() translation (mirrors ToAnthropicTools pattern, adds function wrapper)
+///   - Implement ParseResponse() — deserialize tool_calls[].function.arguments (JSON string → JsonObject)
+///   - Wire up API endpoint and auth
+/// </summary>
+public class OpenAiProvider : IAiProvider
+{
+    private readonly HttpClient _httpClient;
+    public string ProviderId => "gpt";
+
+    public OpenAiProvider(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+    }
+
+    public Task<AiProviderResponse> SendAsync(
+        PromptRequest request,
+        string systemPrompt,
+        IEnumerable<ToolDefinition> tools)
+    {
+        throw new NotImplementedException(
+            "OpenAiProvider is not yet implemented. " +
+            "Implement ToOpenAiTools() and ParseResponse() following the ClaudeProvider pattern.");
     }
 }
 ```
@@ -478,10 +761,15 @@ Env.Load();
 var builder = WebApplication.CreateBuilder(args);
 builder.Configuration.AddEnvironmentVariables();
 
-// Register all providers — DI resolves the right one at runtime
+// Register typed HTTP clients for each provider
 builder.Services.AddHttpClient<ClaudeProvider>();
 builder.Services.AddHttpClient<OpenAiProvider>();
 builder.Services.AddHttpClient<GeminiProvider>();
+
+// Expose all providers as IAiProvider so PromptOrchestrator receives IEnumerable<IAiProvider>
+builder.Services.AddScoped<IAiProvider>(sp => sp.GetRequiredService<ClaudeProvider>());
+builder.Services.AddScoped<IAiProvider>(sp => sp.GetRequiredService<OpenAiProvider>());
+builder.Services.AddScoped<IAiProvider>(sp => sp.GetRequiredService<GeminiProvider>());
 
 builder.Services.AddScoped<PromptOrchestrator>();
 
@@ -496,7 +784,8 @@ app.MapPost("/prompt", async (PromptRequest request, PromptOrchestrator orchestr
     }
     catch (Exception ex)
     {
-        return Results.Problem(ex.Message);
+        // Log ex server-side in production; return a safe message to the client
+        return Results.Problem("An error occurred processing your request.");
     }
 });
 
@@ -865,11 +1154,10 @@ public static class GenerateScriptAction
     {
         var filename = data["filename"]?.ToString();
         var attachTo = data["attach_to"]?.ToString();
-        var scriptKey = data["script_key"]?.ToString();
 
-        if (!scripts.TryGetValue(scriptKey, out var code))
+        if (string.IsNullOrEmpty(filename) || !scripts.TryGetValue(filename, out var code))
         {
-            Debug.LogError($"Claude: No code found for script_key '{scriptKey}'");
+            Debug.LogError($"Claude: No code found for script '{filename}'");
             return;
         }
 
@@ -1052,17 +1340,24 @@ public static class ChatMessageView
 ## Build Phases (Start to Finish)
 
 ### Phase 1 — .NET Backend
-**Goal: Send a prompt, get back clean parsed data**
+**Goal: Send a prompt, get back clean structured action data**
 
 - [ ] `dotnet new webapi -n ClaudeForUnity.Backend`
 - [ ] Add `DotNetEnv` NuGet package
-- [ ] `Domain/Interfaces/IAiProvider.cs` — interface
-- [ ] `Domain/Models/` — PromptRequest, ClaudeResponse, UnityAction
-- [ ] `Application/PromptBuilder.cs` — system prompt
-- [ ] `Application/ActionParser.cs` — hybrid response parsing
-- [ ] `Application/PromptOrchestrator.cs` — resolves provider, coordinates the call
-- [ ] `Infrastructure/Providers/ClaudeProvider.cs` — Anthropic HTTP implementation
-- [ ] Wire up `Program.cs` with DI
+- [ ] `Domain/Interfaces/IAiProvider.cs` — interface (ProviderId + SendAsync with tools)
+- [ ] `Domain/Models/PromptRequest.cs` — includes Model + ApiKey fields
+- [ ] `Domain/Models/ToolDefinition.cs` — provider-agnostic ToolDefinition + ToolParameter
+- [ ] `Domain/Models/AiProviderResponse.cs` — normalized response (Reply + ToolCalls)
+- [ ] `Domain/Models/ClaudeResponse.cs` — outbound shape to Unity plugin
+- [ ] `Domain/Models/UnityAction.cs`
+- [ ] `Application/PromptBuilder.cs` — role + rules system prompt (no format engineering)
+- [ ] `Application/UnityToolDefinitions.cs` — typed JSON schemas for all 5 actions
+- [ ] `Application/ToolUseParser.cs` — maps AiProviderResponse → ClaudeResponse
+- [ ] `Application/PromptOrchestrator.cs` — resolves IAiProvider, calls it, returns result
+- [ ] `Infrastructure/Providers/ClaudeProvider.cs` — Anthropic tool_use HTTP implementation (full)
+- [ ] `Infrastructure/Providers/GeminiProvider.cs` — stub (NotImplementedException, translation notes in comments)
+- [ ] `Infrastructure/Providers/OpenAiProvider.cs` — stub (NotImplementedException, translation notes in comments)
+- [ ] Wire up `Program.cs` with DI (typed clients + IAiProvider registrations)
 - [ ] Add `.env` with API key
 - [ ] Test with Postman or curl before touching Unity
 
@@ -1070,7 +1365,7 @@ public static class ChatMessageView
 ```bash
 curl -X POST http://localhost:3000/prompt \
   -H "Content-Type: application/json" \
-  -d '{"userMessage":"create a cube at 0,1,0","sceneContext":"Scene: TestScene","conversationHistory":[]}'
+  -d '{"userMessage":"create a cube at 0,1,0","sceneContext":"Scene: TestScene","model":"claude-sonnet-4-6","apiKey":"sk-ant-...","conversationHistory":[]}'
 ```
 
 ---
@@ -1184,7 +1479,7 @@ All support .NET 8 out of the box with a Dockerfile or buildpack.
 
 **Why Clean Architecture (Api/Application/Domain/Infrastructure)?** Each layer has one job and depends only on what's below it — this is the Dependency Rule. The biggest payoff: adding a new AI provider means writing one class that implements `IAiProvider` — zero changes to Application or Api. Without this, multi-provider support means duplicating orchestration logic per vendor. This matches how `eShopOnWeb`, `jasontaylordev/CleanArchitecture`, and `ardalis/CleanArchitecture` are structured.
 
-**Why IAiProvider as the abstraction boundary?** The hybrid JSON+csharp format is enforced through the system prompt, not through vendor-specific behavior. Any model (Claude, GPT, Gemini) can be instructed to follow it. So the parsing logic in `ActionParser` is universal — the only thing that varies per provider is the HTTP call, auth headers, and how you extract the text content from the response. `IAiProvider` captures exactly that surface and nothing more.
+**Why IAiProvider as the abstraction boundary?** Tool schemas are provider-agnostic — any model that supports tool_use (Claude, GPT, Gemini) receives the same `UnityToolDefinitions` and returns structured inputs for each action. The only thing that varies per provider is the HTTP call, auth headers, and how to extract text and tool_use blocks from the vendor's response format. Each provider normalizes its response into `AiProviderResponse`; everything above Infrastructure sees only that common shape. `IAiProvider` captures exactly that surface and nothing more.
 
 **Why .NET backend instead of Node?** Keeps the entire stack in C#, easier for Unity developers to understand and modify, and opens the door to eventually compiling the backend into the Unity plugin itself as a DLL — removing the need for a separate server.
 
@@ -1194,7 +1489,7 @@ All support .NET 8 out of the box with a Dockerfile or buildpack.
 
 **Why not call AI providers directly from the Unity plugin?** You could — HTTPS from UnityWebRequest works fine. But then multi-provider support, prompt engineering, and response parsing all live in the plugin, which requires users to update the plugin every time you change anything. The hosted backend gives you a layer you control independently.
 
-**Why the hybrid JSON + csharp block format?** Code inside JSON strings is fragile — one unescaped quote or backslash breaks the entire parse. Separating them into distinct labeled blocks means a malformed script never corrupts the action instructions, and vice versa.
+**Why tool_use instead of a custom response format?** The original hybrid JSON + csharp block approach required engineering a complex system prompt to produce a custom text format, then regex-parsing it back out — a layer of fragility with no safety net. One stray newline or whitespace variation breaks the parse. Native tool_use (`tools` array in the API request) gives Claude typed, schema-validated inputs for every action. The AI fills in the fields; the backend reads structured JSON. Code for `generate_script` becomes an ordinary string parameter — no code-in-JSON escaping risk, no `script_key` ↔ fence label contract, no `Validate()` throwing on malformed output. `ToolUseParser` is 30 lines of straightforward iteration; `ActionParser` was 60 lines of regex with edge cases. The tool_use approach also aligns with the MCP (Model Context Protocol) paradigm, making it easier to extend to MCP-native clients in the future.
 
 **Why Undo registration on every action?** Developers need to trust the tool. If Claude makes a mistake or does something unexpected, one Ctrl+Z should fix it. Without this, developers would be afraid to use it on real projects.
 

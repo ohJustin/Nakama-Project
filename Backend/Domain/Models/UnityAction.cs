@@ -1,6 +1,6 @@
 using System.Text.Json.Nodes;
 
-namespace ClaudeForUnity.Backend.Models;
+namespace ClaudeForUnity.Backend.Domain.Models;
 
 public class UnityAction
 {
