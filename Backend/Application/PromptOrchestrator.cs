@@ -19,8 +19,8 @@ public class PromptOrchestrator
             request.Model.StartsWith(p.ProviderId, StringComparison.OrdinalIgnoreCase))
             ?? throw new InvalidOperationException($"No provider registered for model: {request.Model}");
 
-        var systemPrompt                      = PromptBuilder.BuildSystemPrompt();
-        IEnumerable<ToolDefinition> tools     = UnityToolDefinitions.GetAll();
+        var systemPrompt = PromptBuilder.BuildSystemPrompt();
+        var tools = UnityToolDefinitions.GetAll();
 
         var providerResponse = await provider.SendAsync(request, systemPrompt, tools);
         return ToolUseParser.Parse(providerResponse);

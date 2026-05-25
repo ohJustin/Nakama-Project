@@ -32,7 +32,7 @@ app.MapPost("/prompt", async (PromptRequest request, PromptOrchestrator orchestr
     }
     catch (Exception ex)
     {
-        // TODO: replace with structured logging (ILogger) before production deployment
+        // TODO: replace with structured logging (ILogger)
         Console.Error.WriteLine($"[ERROR] {ex.Message}");
         return Results.Problem("An error occurred processing your request.");
     }
